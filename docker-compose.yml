@@ -1,0 +1,42 @@
+version: "3.9"
+
+name: port-iot-truck-bay
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"   # MQTT (ESP32)
+      - "9001:9001"   # WebSocket (browser)
+    volumes:
+      - ./broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: web
+    restart: unless-stopped
+    environment:
+      # IMPORTANTE: o JS roda no navegador, então use um endereço que o navegador acessa.
+      # Para usar de OUTROS dispositivos na rede, troque por ws://<IP_DO_PC>:9001
+      NEXT_PUBLIC_MQTT_URL: ws://localhost:9001
+      NEXT_PUBLIC_SLOT_ID: bay-01
+      # Deixe vazios se o broker for "allow_anonymous true"
+      NEXT_PUBLIC_MQTT_USERNAME:
+      NEXT_PUBLIC_MQTT_PASSWORD:
+      # Next.js
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+    ports:
+      - "3000:3000"
+    depends_on:
+      - mosquitto
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:

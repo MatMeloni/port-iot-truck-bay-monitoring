@@ -1,142 +1,212 @@
-// Placeholder do firmware ESP32.
-// Ver arquivo de exemplo enviado no chat: WiFi + MQTT (PubSubClient) + histerese.
-// TODO: adicionar versão final aqui.
-
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// ======= PINOS =======
-#define TRIG_PIN 17
-#define ECHO_PIN 18
-#define LED_VERDE 16
-#define LED_VERMELHO 4
+// === Pinos (seu mapeamento atual) ===
+#define TRIG_PIN       12
+#define ECHO_PIN       13
+#define LED_VERDE      33
+#define LED_VERMELHO   25
 
-// ======= WIFI =======
-const char* WIFI_SSID = "SEU_WIFI";
-const char* WIFI_PASS = "SUA_SENHA";
+// === Wi-Fi / MQTT ===
+const char* WIFI_SSID   = NEXT_PUBLIC_WIFI_SSID;
+const char* WIFI_PASS   = NEXT_PUBLIC_WIFI_PASS;
 
-// ======= MQTT (broker no seu PC via Docker) =======
-// Use o IP da sua máquina (ipconfig) e a porta 1883
-const char* MQTT_HOST = "192.168.0.100";  // <--- ajuste aqui
+// IP do PC onde o Mosquitto está rodando (veja "ipconfig")
+const char* MQTT_BROKER = "192.168.1.121";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_USER = "";   // se usar auth no broker
-const char* MQTT_PASSWD = ""; // se usar auth no broker
 
-// ======= IDENTIFICAÇÃO DA VAGA =======
-const char* SPACE_ID = "A1";  // seu protótipo
-String baseTopic = String("parking/space/") + SPACE_ID + "/";
+const char* SLOT_ID     = "bay-01";  // id da vaga
 
-// ======= HISTERESE =======
-enum State { FREE, OCCUPIED };
-State current = FREE;
-const float THRESH_OCCUPIED = 18.0f; // entra ocupado
-const float THRESH_FREE     = 22.0f; // volta a livre
+// Tópicos
+String topicStatus     = String("parking/") + SLOT_ID + "/status";   // retain
+String topicHeartbeat  = String("parking/") + SLOT_ID + "/heartbeat";
+String topicLWT        = String("parking/") + SLOT_ID + "/lwt";
 
-// ======= VARIÁVEIS =======
-long duracao;
-float distancia_cm;
-unsigned long lastTelemetryMs = 0;
-const unsigned long TELEMETRY_INTERVAL_MS = 10000; // envia distância a cada 10s
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
 
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
+// === Sensor / medição ===
+const float SOUND_SPEED_CM_PER_US = 0.034f;
+const uint8_t SAMPLES             = 5;      // média simples
+const float OCCUPIED_THRESHOLD    = 20.0;   // cm  -> abaixo: ocupado
+const float FREE_THRESHOLD        = 25.0;   // cm  -> acima: livre (histerese)
 
-// ======= MEDIÇÃO =======
-float measureDistanceCm() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+// Estado
+enum SlotState { FREE = 0, OCCUPIED = 1 };
+SlotState currentState = FREE;
+SlotState lastState    = FREE;
 
-  duracao = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
-  return (duracao * 0.034f / 2.0f);
+unsigned long lastHeartbeatMs = 0;
+const unsigned long HEARTBEAT_INTERVAL = 30000; // 30s
+
+// === Wi-Fi ===
+void wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("[WiFi] Conectando a ");
+  Serial.print(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - t0 > 15000) { // 15s timeout
+      Serial.println("\n[WiFi] Timeout. Reiniciando WiFi...");
+      WiFi.disconnect();
+      delay(1000);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      t0 = millis();
+    }
+  }
+  Serial.print("\n[WiFi] Conectado. IP: ");
+  Serial.println(WiFi.localIP());
 }
 
-void applyOutputs() {
-  if (current == OCCUPIED) {
+// === MQTT ===
+void mqttConnect() {
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setKeepAlive(30); // opcional
+
+  while (!mqtt.connected()) {
+    String clientId = String("esp32-") + SLOT_ID + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    Serial.print("[MQTT] Conectando ao broker ");
+    Serial.print(MQTT_BROKER); Serial.print(":"); Serial.print(MQTT_PORT);
+    Serial.print(" (clientId="); Serial.print(clientId); Serial.print(") ... ");
+
+    // SEM usuário/senha + LWT via connect()
+    // mqtt.connect(clientId, willTopic, willQos, willRetain, willMessage)
+    if (mqtt.connect(clientId.c_str(), topicLWT.c_str(), 1, true, "offline")) {
+      Serial.println("OK");
+      mqtt.publish(topicLWT.c_str(), "online", true);  // sinaliza online (retain)
+    } else {
+      Serial.print("falhou, rc="); Serial.print(mqtt.state());
+      Serial.println(" -> tentando de novo em 2s");
+      delay(2000);
+    }
+  }
+}
+
+// === Distância com média e timeout ===
+float readDistanceCm() {
+  float sum = 0.0f;
+  uint8_t valid = 0;
+
+  for (uint8_t i = 0; i < SAMPLES; i++) {
+    // Pulso no TRIG
+    digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    // Echo com timeout (30 ms ~ ~5 m)
+    unsigned long duracao = pulseIn(ECHO_PIN, HIGH, 30000UL);
+    if (duracao > 0) {
+      float dist = (duracao * SOUND_SPEED_CM_PER_US) / 2.0f;
+      sum += dist;
+      valid++;
+    }
+    delay(10);
+  }
+
+  if (valid == 0) return NAN;
+  return sum / valid;
+}
+
+void publishStatus(SlotState state, float distance) {
+  const char* statusStr = (state == OCCUPIED) ? "occupied" : "free";
+  bool ok = mqtt.publish(topicStatus.c_str(), statusStr, true); // retain
+  Serial.print("[MQTT] Status -> ");
+  Serial.print(statusStr);
+  Serial.print(" (distance=");
+  Serial.print(distance, 1);
+  Serial.print(" cm, retain) ");
+  Serial.println(ok ? "OK" : "ERRO");
+}
+
+void publishHeartbeat(float distance) {
+  char payload[128];
+  snprintf(payload, sizeof(payload),
+           "{\"slot\":\"%s\",\"distance_cm\":%.1f,\"rssi\":%d,\"uptime_s\":%lu}",
+           SLOT_ID, distance, WiFi.RSSI(), millis()/1000UL);
+  bool ok = mqtt.publish(topicHeartbeat.c_str(), payload, false);
+  Serial.print("[MQTT] Heartbeat -> ");
+  Serial.println(ok ? payload : "ERRO");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_VERMELHO, OUTPUT);
+
+  digitalWrite(LED_VERMELHO, LOW);
+  digitalWrite(LED_VERDE, HIGH);
+
+  Serial.println("\n=== ESP32 Parking MQTT ===");
+  Serial.print("Broker: "); Serial.print(MQTT_BROKER); Serial.print(":"); Serial.println(MQTT_PORT);
+  Serial.print("Topics: "); Serial.print(topicStatus); Serial.print(", ");
+  Serial.print(topicHeartbeat); Serial.print(", ");
+  Serial.println(topicLWT);
+
+  wifiConnect();
+  mqttConnect();
+}
+
+void loop() {
+  // Mantém conexões
+  if (WiFi.status() != WL_CONNECTED) wifiConnect();
+  if (!mqtt.connected())            mqttConnect();
+  mqtt.loop();
+
+  // Mede distância
+  float distancia_cm = readDistanceCm();
+  if (isnan(distancia_cm)) {
+    Serial.println("[SENSOR] Sem leitura válida");
+    delay(200);
+    return;
+  }
+
+  // Estado com histerese
+  SlotState before = currentState;
+  if (currentState == FREE     && distancia_cm < OCCUPIED_THRESHOLD) currentState = OCCUPIED;
+  if (currentState == OCCUPIED && distancia_cm > FREE_THRESHOLD)     currentState = FREE;
+
+  // LEDs
+  if (currentState == OCCUPIED) {
     digitalWrite(LED_VERMELHO, HIGH);
     digitalWrite(LED_VERDE, LOW);
   } else {
     digitalWrite(LED_VERMELHO, LOW);
     digitalWrite(LED_VERDE, HIGH);
   }
-}
 
-void publishStatus(bool force = false) {
-  static State lastSent = FREE;
-  if (force || lastSent != current) {
-    const char* s = (current == OCCUPIED) ? "occupied" : "free";
-    mqtt.publish((baseTopic + "status").c_str(), s, true); // retained
-    lastSent = current;
-  }
-}
-
-void publishDistance(float cm) {
-  char payload[64];
-  snprintf(payload, sizeof(payload), "{\"cm\":%.2f,\"ts\":%lu}", cm, millis());
-  mqtt.publish((baseTopic + "distance").c_str(), payload, true); // retained
-}
-
-void wifiConnect() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-  }
-}
-
-void mqttConnect() {
-  while (!mqtt.connected()) {
-    String clientId = "esp32-parking-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    // LWT: se cair, publica "offline"
-    mqtt.setWill((baseTopic + "online").c_str(), "offline", true, 1);
-    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWD)) {
-      mqtt.publish((baseTopic + "online").c_str(), "online", true);
-      publishStatus(true); // envia status inicial
-    } else {
-      delay(1000);
-    }
-  }
-}
-
-void setup() {
-  Serial.begin(115200);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(LED_VERDE, OUTPUT);
-  pinMode(LED_VERMELHO, OUTPUT);
-
-  wifiConnect();
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqttConnect();
-}
-
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) wifiConnect();
-  if (!mqtt.connected()) mqttConnect();
-  mqtt.loop();
-
-  // Medição
-  distancia_cm = measureDistanceCm();
-  Serial.printf("Dist: %.2f cm\n", distancia_cm);
-
-  // Histerese para estabilidade
-  if (current == FREE && distancia_cm < THRESH_OCCUPIED) {
-    current = OCCUPIED;
-  } else if (current == OCCUPIED && distancia_cm > THRESH_FREE) {
-    current = FREE;
+  // Logs de distância (a cada loop)
+  static uint32_t lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    Serial.print("[SENSOR] Distancia: ");
+    Serial.print(distancia_cm, 1);
+    Serial.println(" cm");
+    lastPrint = millis();
   }
 
-  // Aplica LEDs e publica mudança de estado
-  applyOutputs();
-  publishStatus(); // só envia quando muda
-
-  // Telemetria de distância periódica
-  if (millis() - lastTelemetryMs > TELEMETRY_INTERVAL_MS) {
-    lastTelemetryMs = millis();
-    publishDistance(distancia_cm);
+  // Publica apenas quando mudar de estado
+  if (currentState != lastState) {
+    Serial.print("[STATE] Mudou: ");
+    Serial.print((lastState == OCCUPIED) ? "OCCUPIED" : "FREE");
+    Serial.print(" -> ");
+    Serial.println((currentState == OCCUPIED) ? "OCCUPIED" : "FREE");
+    publishStatus(currentState, distancia_cm);
+    lastState = currentState;
   }
 
-  delay(200); // taxa de leitura
+  // Heartbeat periódico
+  if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL) {
+    publishHeartbeat(distancia_cm);
+    lastHeartbeatMs = millis();
+  }
+
+  delay(120);
 }

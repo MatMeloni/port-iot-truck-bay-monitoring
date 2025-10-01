@@ -1,0 +1,22 @@
+# build
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+# build de produção do Next
+RUN npm run build
+
+# run (standalone se seu next.config habilitar; caso não, use a pasta .next)
+FROM node:20-alpine AS run
+WORKDIR /app
+ENV NODE_ENV=production
+# copie a app compilada
+COPY --from=build /app/.next ./.next
+COPY --from=build /app/public ./public
+COPY --from=build /app/package*.json ./
+# se seu build gerou "standalone", prefira copiar /app/.next/standalone e /app/.next/static
+# e trocar o CMD para "node server.js". Mantive o "next start" genérico.
+RUN npm ci --omit=dev
+EXPOSE 3000
+CMD ["npx", "next", "start", "-p", "3000", "-H", "0.0.0.0"]
