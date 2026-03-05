@@ -8,8 +8,8 @@
 #define LED_VERMELHO   25
 
 // === Wi-Fi / MQTT ===
-const char* WIFI_SSID   = NEXT_PUBLIC_WIFI_SSID;
-const char* WIFI_PASS   = NEXT_PUBLIC_WIFI_PASS;
+const char* WIFI_SSID   = "YOUR_WIFI_SSID";
+const char* WIFI_PASS   = "YOUR_WIFI_PASSWORD";
 
 // IP do PC onde o Mosquitto está rodando (veja "ipconfig")
 const char* MQTT_BROKER = "192.168.1.121";
@@ -18,9 +18,9 @@ const uint16_t MQTT_PORT = 1883;
 const char* SLOT_ID     = "bay-01";  // id da vaga
 
 // Tópicos
-String topicStatus     = String("parking/") + SLOT_ID + "/status";   // retain
-String topicHeartbeat  = String("parking/") + SLOT_ID + "/heartbeat";
-String topicLWT        = String("parking/") + SLOT_ID + "/lwt";
+String topicStatus     = String("parking/space/") + SLOT_ID + "/status";   // retain
+String topicHeartbeat  = String("parking/space/") + SLOT_ID + "/heartbeat";
+String topicOnline     = String("parking/space/") + SLOT_ID + "/online";
 
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
@@ -70,15 +70,21 @@ void mqttConnect() {
 
   while (!mqtt.connected()) {
     String clientId = String("esp32-") + SLOT_ID + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    char offlinePayload[96];
+    char onlinePayload[96];
+    snprintf(offlinePayload, sizeof(offlinePayload),
+             "{\"schemaVersion\":1,\"slotId\":\"%s\",\"online\":false}", SLOT_ID);
+    snprintf(onlinePayload, sizeof(onlinePayload),
+             "{\"schemaVersion\":1,\"slotId\":\"%s\",\"online\":true}", SLOT_ID);
     Serial.print("[MQTT] Conectando ao broker ");
     Serial.print(MQTT_BROKER); Serial.print(":"); Serial.print(MQTT_PORT);
     Serial.print(" (clientId="); Serial.print(clientId); Serial.print(") ... ");
 
     // SEM usuário/senha + LWT via connect()
     // mqtt.connect(clientId, willTopic, willQos, willRetain, willMessage)
-    if (mqtt.connect(clientId.c_str(), topicLWT.c_str(), 1, true, "offline")) {
+    if (mqtt.connect(clientId.c_str(), topicOnline.c_str(), 1, true, offlinePayload)) {
       Serial.println("OK");
-      mqtt.publish(topicLWT.c_str(), "online", true);  // sinaliza online (retain)
+      mqtt.publish(topicOnline.c_str(), onlinePayload, true);  // sinaliza online (retain)
     } else {
       Serial.print("falhou, rc="); Serial.print(mqtt.state());
       Serial.println(" -> tentando de novo em 2s");
@@ -114,7 +120,11 @@ float readDistanceCm() {
 
 void publishStatus(SlotState state, float distance) {
   const char* statusStr = (state == OCCUPIED) ? "occupied" : "free";
-  bool ok = mqtt.publish(topicStatus.c_str(), statusStr, true); // retain
+  char payload[128];
+  snprintf(payload, sizeof(payload),
+           "{\"schemaVersion\":1,\"slotId\":\"%s\",\"status\":\"%s\"}",
+           SLOT_ID, statusStr);
+  bool ok = mqtt.publish(topicStatus.c_str(), payload, true); // retain
   Serial.print("[MQTT] Status -> ");
   Serial.print(statusStr);
   Serial.print(" (distance=");
@@ -126,7 +136,7 @@ void publishStatus(SlotState state, float distance) {
 void publishHeartbeat(float distance) {
   char payload[128];
   snprintf(payload, sizeof(payload),
-           "{\"slot\":\"%s\",\"distance_cm\":%.1f,\"rssi\":%d,\"uptime_s\":%lu}",
+           "{\"schemaVersion\":1,\"slotId\":\"%s\",\"distanceCm\":%.1f,\"rssi\":%d,\"uptimeS\":%lu}",
            SLOT_ID, distance, WiFi.RSSI(), millis()/1000UL);
   bool ok = mqtt.publish(topicHeartbeat.c_str(), payload, false);
   Serial.print("[MQTT] Heartbeat -> ");
@@ -149,7 +159,7 @@ void setup() {
   Serial.print("Broker: "); Serial.print(MQTT_BROKER); Serial.print(":"); Serial.println(MQTT_PORT);
   Serial.print("Topics: "); Serial.print(topicStatus); Serial.print(", ");
   Serial.print(topicHeartbeat); Serial.print(", ");
-  Serial.println(topicLWT);
+  Serial.println(topicOnline);
 
   wifiConnect();
   mqttConnect();

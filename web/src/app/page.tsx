@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import {
@@ -12,22 +12,26 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { useMqtt } from "@/hooks/useMqtt";
-import type { ClientState, SlotStatus } from "@/hooks/useMqtt";
+import {
+  createParkingStream,
+  fetchSlotHistory,
+  fetchSlots,
+  type ParkingHistoryEvent,
+  type SlotSnapshot,
+  type SlotStatus,
+} from "@/lib/backendApi";
+
+type ClientState = "connecting" | "connected" | "error";
 
 const CLIENT_STATE_LABEL: Record<ClientState, string> = {
-  demo: "Demo",
   connecting: "Conectando",
   connected: "Conectado",
-  reconnecting: "Reconectando",
   error: "Erro",
 };
 
 const CLIENT_STATE_STYLE: Record<ClientState, string> = {
-  demo: "bg-slate-200 text-slate-700",
   connecting: "bg-amber-100 text-amber-700",
   connected: "bg-emerald-100 text-emerald-700",
-  reconnecting: "bg-amber-100 text-amber-700",
   error: "bg-red-100 text-red-700",
 };
 
@@ -69,6 +73,14 @@ function formatDistance(value?: number): string {
   return `${value.toFixed(1)} cm`;
 }
 
+function formatDateTime(value: number): string {
+  return new Intl.DateTimeFormat("pt-BR", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(value);
+}
+
 function formatUptime(seconds?: number): string {
   if (seconds === undefined) return "-";
   const total = Math.max(0, Math.floor(seconds));
@@ -78,55 +90,141 @@ function formatUptime(seconds?: number): string {
   const parts: string[] = [];
   if (hours) parts.push(`${hours}h`);
   if (minutes) parts.push(`${minutes}min`);
-  if (!hours && !minutes) {
-    parts.push(`${secs}s`);
-  } else if (secs && parts.length < 2) {
+  if (secs && parts.length < 2) {
     parts.push(`${secs}s`);
   }
   return parts.join(" ") || "0s";
 }
 
-export default function Page() {
-  const {
-    clientState,
-    status,
-    distance,
-    rssi,
-    uptime,
-    lastUpdated,
-    history,
-    slotId,
-    setSlotId,
-    retainWarning,
-    error,
-    isDemo,
-  } = useMqtt();
+function formatOnline(value?: boolean): string {
+  if (value === undefined) return "-";
+  return value ? "Sim" : "Nao";
+}
 
-  const statusStyle = STATUS_STYLES[status] ?? STATUS_STYLES.unknown;
-  const historyItems = useMemo(() => history.slice(-10).reverse(), [history]);
+function formatHistoryValue(event: ParkingHistoryEvent): string {
+  if (event.eventType === "heartbeat") {
+    return `${event.distanceCm?.toFixed(1) ?? "-"} cm`;
+  }
+  if (event.eventType === "status") {
+    return event.status ?? "-";
+  }
+  return event.online ? "online" : "offline";
+}
+
+export default function Page() {
+  const [clientState, setClientState] = useState<ClientState>("connecting");
+  const [error, setError] = useState<string | undefined>(undefined);
+  const [slots, setSlots] = useState<Record<string, SlotSnapshot>>({});
+  const [selectedSlot, setSelectedSlot] = useState<string>("");
+  const [history, setHistory] = useState<ParkingHistoryEvent[]>([]);
+
+  useEffect(() => {
+    const abortController = new AbortController();
+    fetchSlots(abortController.signal)
+      .then((items) => {
+        const normalized = Object.fromEntries(items.map((slot) => [slot.slotId, slot]));
+        setSlots(normalized);
+        setSelectedSlot((current) => current || items[0]?.slotId || "");
+      })
+      .catch((fetchError: unknown) => {
+        const message =
+          fetchError instanceof Error ? fetchError.message : "Falha ao carregar slots";
+        setError(message);
+      });
+
+    return () => abortController.abort();
+  }, []);
+
+  useEffect(() => {
+    const eventSource = createParkingStream();
+
+    eventSource.onopen = () => {
+      setClientState("connected");
+      setError(undefined);
+    };
+
+    eventSource.onerror = () => {
+      setClientState("error");
+      setError("Falha na conexao em tempo real com o backend.");
+    };
+
+    eventSource.addEventListener("slot_update", (evt) => {
+      try {
+        const parsed = JSON.parse((evt as MessageEvent<string>).data) as SlotSnapshot;
+        setSlots((current) => ({ ...current, [parsed.slotId]: parsed }));
+      } catch {
+        setError("Evento recebido com formato invalido.");
+      }
+    });
+
+    return () => eventSource.close();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedSlot) {
+      setHistory([]);
+      return;
+    }
+    const abortController = new AbortController();
+    fetchSlotHistory(selectedSlot, 20, abortController.signal)
+      .then((items) => setHistory(items))
+      .catch((fetchError: unknown) => {
+        const message =
+          fetchError instanceof Error ? fetchError.message : "Falha ao carregar historico";
+        setError(message);
+      });
+    return () => abortController.abort();
+  }, [selectedSlot]);
+
+  const slotList = useMemo(
+    () => Object.values(slots).sort((a, b) => a.slotId.localeCompare(b.slotId)),
+    [slots],
+  );
+
+  const selected = useMemo(
+    () => (selectedSlot ? slots[selectedSlot] : undefined),
+    [selectedSlot, slots],
+  );
+
+  const statusStyle = STATUS_STYLES[selected?.status ?? "unknown"] ?? STATUS_STYLES.unknown;
+  const overview = useMemo(() => {
+    let occupied = 0;
+    let online = 0;
+    for (const slot of slotList) {
+      if (slot.status === "occupied") occupied += 1;
+      if (slot.online) online += 1;
+    }
+    return {
+      total: slotList.length,
+      occupied,
+      free: Math.max(slotList.length - occupied, 0),
+      online,
+    };
+  }, [slotList]);
 
   return (
     <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-8 px-6 py-10">
       <section className="space-y-4">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-semibold text-slate-900">Monitoramento da vaga</h1>
+            <h1 className="text-2xl font-semibold text-slate-900">Monitoramento das vagas</h1>
             <p className="text-sm text-slate-500">
-              Status da vaga, distância e métricas de telemetria via MQTT.
+              Dados publicados no Mosquitto, processados no backend NestJS e exibidos em tempo real.
             </p>
           </div>
           <div className="w-full max-w-xs">
             <label className="block text-sm font-medium text-slate-600" htmlFor="slot-id">
-              Slot monitorado
+              Slot selecionado
             </label>
             <Input
               id="slot-id"
-              value={slotId}
-              onChange={(event) => setSlotId(event.target.value)}
+              value={selectedSlot}
+              onChange={(event) => setSelectedSlot(event.target.value)}
               className="mt-1"
+              placeholder={slotList[0]?.slotId ?? "bay-01"}
             />
             <p className="mt-1 text-xs text-slate-400">
-              Override em runtime de <code>NEXT_PUBLIC_SLOT_ID</code>.
+              Slots conhecidos: {slotList.map((slot) => slot.slotId).join(", ") || "nenhum"}.
             </p>
           </div>
         </div>
@@ -134,33 +232,55 @@ export default function Page() {
           <Badge className={`${CLIENT_STATE_STYLE[clientState]} border-transparent`}>
             {CLIENT_STATE_LABEL[clientState]}
           </Badge>
-          {isDemo && (
-            <span className="text-xs text-amber-600">
-              Modo demo ativo - defina <code>NEXT_PUBLIC_MQTT_URL</code> para conectar no broker.
-            </span>
-          )}
+          <span className="text-xs text-slate-500">Fonte: stream SSE do backend (`/api/parking/stream`).</span>
         </div>
         {error && (
           <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
             {error}
           </div>
         )}
-        {retainWarning && !isDemo && (
-          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
-            Nenhum payload retido recebido em até 3s. Verifique se os tópicos usam retain.
-          </div>
-        )}
       </section>
+
+      <div className="grid gap-4 sm:grid-cols-4">
+        <Card>
+          <CardHeader>
+            <CardDescription>Vagas totais</CardDescription>
+            <CardTitle className="text-2xl">{overview.total}</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardDescription>Vagas livres</CardDescription>
+            <CardTitle className="text-2xl text-emerald-600">{overview.free}</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardDescription>Vagas ocupadas</CardDescription>
+            <CardTitle className="text-2xl text-rose-600">{overview.occupied}</CardTitle>
+          </CardHeader>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardDescription>Dispositivos online</CardDescription>
+            <CardTitle className="text-2xl text-sky-600">{overview.online}</CardTitle>
+          </CardHeader>
+        </Card>
+      </div>
 
       <Card>
         <CardHeader className="items-start gap-4">
           <div>
-            <CardTitle className="text-xl font-semibold text-slate-900">Vaga {slotId}</CardTitle>
-            <CardDescription>Status atual do sensor e detalhes de telemetria.</CardDescription>
+            <CardTitle className="text-xl font-semibold text-slate-900">
+              Vaga {selectedSlot || "-"}
+            </CardTitle>
+            <CardDescription>Status atual, telemetria e ultimo evento recebido.</CardDescription>
           </div>
           <CardAction>
             <p className="text-xs font-medium uppercase text-slate-500">Última atualização</p>
-            <p className="text-sm text-slate-700">{formatRelativeTime(lastUpdated)}</p>
+            <p className="text-sm text-slate-700">
+              {selected?.ingestedAt ? formatRelativeTime(selected.ingestedAt) : "-"}
+            </p>
           </CardAction>
         </CardHeader>
         <CardContent className="space-y-6">
@@ -172,36 +292,40 @@ export default function Page() {
               </div>
               <div>
                 <p className="text-sm font-medium text-slate-500">Distância</p>
-                <p className="text-3xl font-semibold text-slate-900">{formatDistance(distance)}</p>
-                <p className="text-xs text-slate-400">
-                  {distance === undefined
-                    ? "Sem nova leitura há pelo menos 10s."
-                    : "Última leitura vinda do heartbeat."}
+                <p className="text-3xl font-semibold text-slate-900">
+                  {formatDistance(selected?.distanceCm)}
                 </p>
+                <p className="text-xs text-slate-400">Atualizada por eventos de heartbeat.</p>
               </div>
               <div className="flex gap-6 text-sm text-slate-600">
                 <div>
                   <p className="font-medium text-slate-500">RSSI</p>
-                  <p>{rssi !== undefined ? `${Math.round(rssi)} dBm` : "-"}</p>
+                  <p>
+                    {typeof selected?.rssi === "number"
+                      ? `${Math.round(selected.rssi)} dBm`
+                      : "-"}
+                  </p>
                 </div>
                 <div>
                   <p className="font-medium text-slate-500">Uptime</p>
-                  <p>{formatUptime(uptime)}</p>
+                  <p>{formatUptime(selected?.uptimeS)}</p>
+                </div>
+                <div>
+                  <p className="font-medium text-slate-500">Online</p>
+                  <p>{formatOnline(selected?.online)}</p>
                 </div>
               </div>
             </div>
             <div className="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-4">
               <p className="text-sm font-medium text-slate-600">Histórico recente</p>
-              {historyItems.length === 0 ? (
+              {history.length === 0 ? (
                 <p className="text-sm text-slate-500">Sem leituras registradas ainda.</p>
               ) : (
                 <ul className="flex flex-col gap-2 text-sm text-slate-600">
-                  {historyItems.map((point) => (
-                    <li key={point.t} className="flex items-center justify-between gap-4">
-                      <span>{formatRelativeTime(point.t)}</span>
-                      <span className="font-medium text-slate-900">
-                        {point.d.toFixed(1)} cm
-                      </span>
+                  {history.map((event) => (
+                    <li key={event.id} className="flex items-center justify-between gap-4">
+                      <span>{formatDateTime(new Date(event.ingestedAt).getTime())}</span>
+                      <span className="font-medium text-slate-900">{formatHistoryValue(event)}</span>
                     </li>
                   ))}
                 </ul>
@@ -215,8 +339,15 @@ export default function Page() {
             </div>
             <div>
               <p className="font-medium text-slate-600">Tópicos monitorados</p>
-              <p className="font-mono text-xs text-slate-600">{`parking/${slotId}/status`}</p>
-              <p className="font-mono text-xs text-slate-600">{`parking/${slotId}/heartbeat`}</p>
+              <p className="font-mono text-xs text-slate-600">
+                {`parking/space/${selectedSlot || "<slotId>"}/status`}
+              </p>
+              <p className="font-mono text-xs text-slate-600">
+                {`parking/space/${selectedSlot || "<slotId>"}/heartbeat`}
+              </p>
+              <p className="font-mono text-xs text-slate-600">
+                {`parking/space/${selectedSlot || "<slotId>"}/online`}
+              </p>
             </div>
           </div>
         </CardContent>
