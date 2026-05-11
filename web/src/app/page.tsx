@@ -203,7 +203,7 @@ export default function Page() {
   }, [slotList]);
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-8 px-6 py-10">
+    <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-8 px-6 py-8">
       <section className="space-y-4">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
